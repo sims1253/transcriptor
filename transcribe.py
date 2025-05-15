@@ -1,4 +1,5 @@
 import os
+import shutil # Added for moving files
 import torch
 import torchaudio # Added for pre-loading audio
 import argparse
@@ -294,10 +295,10 @@ def transcribe_and_diarize(audio_path, num_speakers, output_file, hf_token=None,
 
 # --- Command Line Argument Parsing ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Transcribe long audio with Whisper (large-v3 via Transformers) and speaker diarization.") # Updated description
-    parser.add_argument("audio_path", help="Path to the input audio file (e.g., wav, mp3, flac).")
+    parser = argparse.ArgumentParser(description="Transcribe long audio with Whisper (large-v3 via Transformers) and speaker diarization. Can process a single file or all files in an 'input' directory.")
+    parser.add_argument("audio_path", nargs='?', default=None, help="Path to the input audio file (e.g., wav, mp3, flac). If not provided, processes all files in the 'input/' directory.")
     parser.add_argument("num_speakers", type=int, help="The exact number of speakers in the audio (set to 1 to skip diarization).")
-    parser.add_argument("-o", "--output_file", default="transcript.txt", help="Path to save the output transcript (default: transcript.txt).")
+    parser.add_argument("-o", "--output_file", default="transcript.txt", help="Path to save the output transcript. For single file mode, defaults to 'output/<input_filename_without_ext>.txt' if not specified. For directory processing, this argument is ignored and outputs are saved in 'output/' with original names and .txt extension.")
     parser.add_argument("--hf_token", default=None, help="Hugging Face authentication token for pyannote (optional, reads from cache if not provided).")
     parser.add_argument("--device", default=None, choices=['cuda:0', 'cpu'], help="Device to use ('cuda:0' or 'cpu'). Auto-detects if not specified.")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for transcription pipeline (default: 16). Lower if you encounter memory issues.") # Changed back to batch_size
@@ -305,16 +306,112 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Basic check for audio file existence
-    if not os.path.exists(args.audio_path):
-        print(f"Error: Audio file not found at {args.audio_path}")
+    input_folder = "input"
+    output_folder = "output"
+    supported_extensions = ('.wav', '.mp3', '.flac', '.m4a', '.ogg', '.opus', '.aac', '.wma', '.aiff', '.aif')
+
+    # Ensure output folder exists
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+        print(f"Created output directory: {output_folder}")
+
+    if args.audio_path:
+        # --- Process a single audio file ---
+        if not os.path.exists(args.audio_path):
+            print(f"Error: Audio file not found at {args.audio_path}")
+        elif not os.path.isfile(args.audio_path):
+            print(f"Error: Provided path {args.audio_path} is not a file.")
+        else:
+            audio_file_to_process = args.audio_path
+            base_name = os.path.basename(audio_file_to_process)
+            name_without_ext = os.path.splitext(base_name)[0]
+
+            # Determine output file path for single file mode
+            if args.output_file != parser.get_default("output_file"): # User specified a custom output via -o
+                output_txt_path = args.output_file
+                print(f"Processing single file: {audio_file_to_process}, custom output transcript: {output_txt_path}")
+            else:
+                # Default behavior: output to 'output/' folder with same name + .txt
+                output_txt_path = os.path.join(output_folder, f"{name_without_ext}.txt")
+                print(f"Processing single file: {audio_file_to_process}, output transcript: {output_txt_path}")
+
+            transcribe_and_diarize(
+                audio_file_to_process,
+                args.num_speakers,
+                output_txt_path,
+                args.hf_token,
+                args.device,
+                args.batch_size,
+                args.language
+            )
+
+            # Move the processed input audio file to the output folder
+            try:
+                # Ensure the source file is not already in the output folder
+                # (e.g. if input path was output/somefile.mp3 or a relative path resolving there)
+                if os.path.abspath(os.path.dirname(audio_file_to_process)) != os.path.abspath(output_folder):
+                    destination_audio_path = os.path.join(output_folder, base_name)
+                    # Check if a file with the same name already exists in the destination
+                    if os.path.exists(destination_audio_path):
+                        print(f"Warning: File {base_name} already exists in {output_folder}. Overwriting.")
+                    print(f"Moving processed audio file {audio_file_to_process} to {destination_audio_path}")
+                    shutil.move(audio_file_to_process, destination_audio_path)
+                    print(f"Successfully moved {base_name} to {output_folder}")
+                else:
+                    print(f"Audio file {audio_file_to_process} is already in the output folder '{output_folder}'. No move needed.")
+            except Exception as e:
+                print(f"Error moving file {audio_file_to_process} to {output_folder}: {e}")
+
     else:
-        transcribe_and_diarize(
-            args.audio_path,
-            args.num_speakers,
-            args.output_file,
-            args.hf_token,
-            args.device,
-            args.batch_size,
-            args.language # Pass language argument
-        )
+        # --- Process all files in the input folder ---
+        print(f"\nNo specific audio file provided. Processing all supported audio files in '{input_folder}' directory...")
+        if not os.path.exists(input_folder):
+            print(f"Error: Input directory '{input_folder}' does not exist. Please create it and place audio files inside.")
+        elif not os.path.isdir(input_folder):
+            print(f"Error: '{input_folder}' is not a directory.")
+        else:
+            audio_files_found = [
+                f for f in os.listdir(input_folder)
+                if f.lower().endswith(supported_extensions) and os.path.isfile(os.path.join(input_folder, f))
+            ]
+
+            if not audio_files_found:
+                print(f"No supported audio files found in '{input_folder}'. Supported extensions: {supported_extensions}")
+            else:
+                print(f"Found {len(audio_files_found)} audio file(s) to process in '{input_folder}': {', '.join(audio_files_found)}")
+                files_processed_count = 0
+                for filename in audio_files_found:
+                    audio_file_path = os.path.join(input_folder, filename)
+                    name_without_ext = os.path.splitext(filename)[0]
+                    output_txt_file = os.path.join(output_folder, f"{name_without_ext}.txt")
+
+                    print(f"\n--- Processing: {filename} ({files_processed_count + 1}/{len(audio_files_found)}) ---")
+                    print(f"Input audio: {audio_file_path}")
+                    print(f"Output transcript: {output_txt_file}")
+
+                    transcribe_and_diarize(
+                        audio_file_path,
+                        args.num_speakers,
+                        output_txt_file,
+                        args.hf_token,
+                        args.device,
+                        args.batch_size,
+                        args.language
+                    )
+                    files_processed_count += 1
+
+                    # Move the processed input audio file to the output folder
+                    try:
+                        destination_audio_path = os.path.join(output_folder, filename)
+                        if os.path.exists(destination_audio_path):
+                            print(f"Warning: File {filename} already exists in {output_folder}. Overwriting.")
+                        print(f"Moving processed audio file {audio_file_path} to {destination_audio_path}")
+                        shutil.move(audio_file_path, destination_audio_path)
+                        print(f"Successfully moved {filename} to {output_folder}")
+                    except Exception as e:
+                        print(f"Error moving file {audio_file_path} to {output_folder}: {e}")
+                
+                if files_processed_count > 0:
+                    print(f"\nFinished processing {files_processed_count} audio file(s) from '{input_folder}'.")
+                else: # Should not happen if audio_files_found was populated, but as a safeguard
+                    print(f"\nNo audio files were processed from '{input_folder}'.")
